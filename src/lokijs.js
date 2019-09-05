@@ -712,15 +712,6 @@
       return result;
     }
 
-    function localStorageAvailable() {
-      try {
-        return (window && window.localStorage !== undefined && window.localStorage !== null);
-      } catch (e) {
-        return false;
-      }
-    }
-
-
     /**
      * LokiEventEmitter is a minimalist version of EventEmitter. It enables any
      * constructor that inherits EventEmitter to emit events and trigger
@@ -887,7 +878,6 @@
       this.events = {
         'init': [],
         'loaded': [],
-        'flushChanges': [],
         'close': [],
         'changes': [],
         'warning': []
@@ -928,12 +918,12 @@
         }
       })
 
-      if (window) {
-        if (!('indexedDB' in window)) {
+      if (globalThis) {
+        if (!('indexedDB' in globalThis)) {
           throw new Error("CrazyLoki only supports browsers with access to indexedDB.")
         }
-      } else if (globalThis) {
-        if (!('indexedDB' in globalThis)) {
+      } else if (window) {
+        if (!('indexedDB' in window)) {
           throw new Error("CrazyLoki only supports browsers with access to indexedDB.")
         }
       } else {
@@ -1770,61 +1760,6 @@
         this.on('close', callback);
       }
       this.emit('close');
-    };
-
-    /**-------------------------+
-    | Changes API               |
-    +--------------------------*/
-
-    /**
-     * The Changes API enables the tracking the changes occurred in the collections since the beginning of the session,
-     * so it's possible to create a differential dataset for synchronization purposes (possibly to a remote db)
-     */
-
-    /**
-     * (Changes API) : takes all the changes stored in each
-     * collection and creates a single array for the entire database. If an array of names
-     * of collections is passed then only the included collections will be tracked.
-     *
-     * @param {array=} optional array of collection names. No arg means all collections are processed.
-     * @returns {array} array of changes
-     * @see private method createChange() in Collection
-     * @memberof Loki
-     */
-    Loki.prototype.generateChangesNotification = function (arrayOfCollectionNames) {
-      function getCollName(coll) {
-        return coll.name;
-      }
-      var changes = [],
-        selectedCollections = arrayOfCollectionNames || this.collections.map(getCollName);
-
-      this.collections.forEach(function (coll) {
-        if (selectedCollections.indexOf(getCollName(coll)) !== -1) {
-          changes = changes.concat(coll.getChanges());
-        }
-      });
-      return changes;
-    };
-
-    /**
-     * (Changes API) - stringify changes for network transmission
-     * @returns {string} string representation of the changes
-     * @memberof Loki
-     */
-    Loki.prototype.serializeChanges = function (collectionNamesArray) {
-      return JSON.stringify(this.generateChangesNotification(collectionNamesArray));
-    };
-
-    /**
-     * (Changes API) : clears all the changes in all collections.
-     * @memberof Loki
-     */
-    Loki.prototype.clearChanges = function () {
-      this.collections.forEach(function (coll) {
-        if (coll.flushChanges) {
-          coll.flushChanges();
-        }
-      });
     };
 
     /*------------------+
@@ -4908,8 +4843,6 @@
 
       this.observerCallback = observerCallback;
 
-      this.flushChanges = flushChanges;
-
       this.on('delete', function deleteCallback(obj, isSync = false) {
         if (!isSync) {
           self.createChange(self.name, 'R', obj);
@@ -4919,8 +4852,6 @@
       this.on('warning', function (warning) {
         self.lokiConsoleWrapper.warn(warning);
       });
-      // for de-serialization purposes
-      flushChanges();
     }
 
     Collection.prototype = new LokiEventEmitter();
