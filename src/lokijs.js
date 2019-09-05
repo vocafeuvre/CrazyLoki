@@ -836,7 +836,6 @@
      * @implements LokiEventEmitter
      * @param {string} filename - name of the file to be saved to
      * @param {object=} options - (Optional) config options object
-     * @param {string} options.env - override environment detection as 'NODEJS', 'BROWSER', 'CORDOVA'
      * @param {boolean} [options.verbose=false] - enable console output
      * @param {boolean} [options.autosave=false] - enables autosave
      * @param {int} [options.autosaveInterval=5000] - time interval (in milliseconds) between saves (if dirty)
@@ -894,48 +893,56 @@
         'warning': []
       };
 
-      var getENV = function () {
-        if (typeof global !== 'undefined' && (global.android || global.NSObject)) {
-           // If no adapter assume nativescript which needs adapter to be passed manually
-           return 'NATIVESCRIPT'; //nativescript
+      this.changesChannel = new BroadcastChannel(this.filename)
+
+      var saveChanges = function (change) {
+        var collection = this.getCollection(change.name)
+
+        if (change.operation === "I") {
+            var objToInsert = Object.keys(change.obj)
+                                .filter(function (value) { return value !== "$loki" && value !== "meta" })
+                                .reduce(function (accum, val) { accum[val] = change.obj[val]; return accum }, {})
+            
+            collection.insert(objToInsert, true)
+        } else if (change.operation === "U") {
+            collection.update(change.obj, true)
+        } else if (change.operation === "R") {
+            collection.remove(change.obj, true)
         }
 
-        if (typeof window === 'undefined') {
-          return 'NODEJS';
+        if (this.autosaveChange) {
+          this.saveDatabase(function (err) {
+              if (err) {
+                  console.log("Error saving to the database.")
+              } else {
+                  console.log("I saved!")
+              }
+          })
         }
-
-        if (typeof global !== 'undefined' && global.window && typeof process !== 'undefined') {
-          return 'NODEJS'; //node-webkit
-        }
-
-        if (typeof document !== 'undefined') {
-          if (document.URL.indexOf('http://') === -1 && document.URL.indexOf('https://') === -1) {
-            return 'CORDOVA';
-          }
-          return 'BROWSER';
-        }
-        return 'CORDOVA';
-      };
-
-      // refactored environment detection due to invalid detection for browser environments.
-      // if they do not specify an options.env we want to detect env rather than default to nodejs.
-      // currently keeping two properties for similar thing (options.env and options.persistenceMethod)
-      //   might want to review whether we can consolidate.
-      if (options && options.hasOwnProperty('env')) {
-        this.ENV = options.env;
-      } else {
-        this.ENV = getENV();
       }
 
-      // not sure if this is necessary now that i have refactored the line above
-      if (this.ENV === 'undefined') {
-        this.ENV = 'NODEJS';
+      var self = this
+      this.changesChannel.addEventListener("message", function (event) {
+        if (event.data.type === "POST_CHANGES") {
+          saveChanges.call(self, event.data.payload)
+        }
+      })
+
+      if (window) {
+        if (!('indexedDB' in window)) {
+          throw new Error("CrazyLoki only supports browsers with access to indexedDB.")
+        }
+      } else if (globalThis) {
+        if (!('indexedDB' in globalThis)) {
+          throw new Error("CrazyLoki only supports browsers with access to indexedDB.")
+        }
+      } else {
+        throw new Error("CrazyLoki only supports modern browsers.")
       }
 
       this.configureOptions(options, true);
 
       this.on('init', this.clearChanges);
-
     }
 
     // db class is an EventEmitter
@@ -954,12 +961,10 @@
       return adapter;
     };
 
-
     /**
      * Allows reconfiguring database options
      *
      * @param {object} options - configuration options to apply to loki db object
-     * @param {string} options.env - override environment detection as 'NODEJS', 'BROWSER', 'CORDOVA'
      * @param {boolean} options.verbose - enable console output (default is 'false')
      * @param {boolean} options.autosave - enables autosave
      * @param {int} options.autosaveInterval - time interval (in milliseconds) between saves (if dirty)
@@ -972,45 +977,17 @@
      * @memberof Loki
      */
     Loki.prototype.configureOptions = function (options, initialConfig) {
-      var defaultPersistence = {
-          'NODEJS': 'fs',
-          'BROWSER': 'localStorage',
-          'CORDOVA': 'localStorage',
-          'MEMORY': 'memory'
-        },
-        persistenceMethods = {
-          'fs': LokiFsAdapter,
-          'localStorage': LokiLocalStorageAdapter,
-          'memory': LokiMemoryAdapter
-        };
-
       this.options = {};
 
-      this.persistenceMethod = null;
+      // CrazyLoki uses IndexedDB as default. No excuses.
+      this.persistenceMethod = "adapter";
       // retain reference to optional persistence adapter 'instance'
       // currently keeping outside options because it can't be serialized
-      this.persistenceAdapter = null;
+      this.persistenceAdapter = new LokiIndexedAdapter();
 
       // process the options
       if (typeof (options) !== 'undefined') {
         this.options = options;
-
-        if (this.options.hasOwnProperty('persistenceMethod')) {
-          // check if the specified persistence method is known
-          if (typeof (persistenceMethods[options.persistenceMethod]) == 'function') {
-            this.persistenceMethod = options.persistenceMethod;
-            this.persistenceAdapter = new persistenceMethods[options.persistenceMethod]();
-          }
-          // should be throw an error here, or just fall back to defaults ??
-        }
-
-        // if user passes adapter, set persistence mode to adapter and retain persistence adapter instance
-        if (this.options.hasOwnProperty('adapter')) {
-          this.persistenceMethod = 'adapter';
-          this.persistenceAdapter = options.adapter;
-          this.options.adapter = null;
-        }
-
 
         // if they want to load database on loki instantiation, now is a good time to load... after adapter set and before possible autosave initiation
         if (options.autoload && initialConfig) {
@@ -1037,6 +1014,10 @@
           }
         }
 
+        if (this.options.hasOwnProperty('autosaveChange') && this.options.autosaveChange) {
+          this.autosaveChange = true
+        }
+
         if (this.options.hasOwnProperty('throttledSaves')) {
           this.throttledSaves = this.options.throttledSaves;
         }
@@ -1051,15 +1032,6 @@
       if (!this.options.hasOwnProperty('destructureDelimiter')) {
         this.options.destructureDelimiter = '$<\n';
       }
-
-      // if by now there is no adapter specified by user nor derived from persistenceMethod: use sensible defaults
-      if (this.persistenceAdapter === null) {
-        this.persistenceMethod = defaultPersistence[this.ENV];
-        if (this.persistenceMethod) {
-          this.persistenceAdapter = new persistenceMethods[this.persistenceMethod]();
-        }
-      }
-
     };
 
     /**
@@ -1103,8 +1075,6 @@
      * @param {array=} [options.indices=[]] - array property names to define binary indexes for
      * @param {boolean} [options.asyncListeners=false] - whether listeners are called asynchronously
      * @param {boolean} [options.disableMeta=false] - set to true to disable meta property on documents
-     * @param {boolean} [options.disableChangesApi=true] - set to false to enable Changes Api
-     * @param {boolean} [options.disableDeltaChangesApi=true] - set to false to enable Delta Changes API (requires Changes API, forces cloning)
      * @param {boolean} [options.autoupdate=false] - use Object.observe to update objects automatically
      * @param {boolean} [options.clone=false] - specify whether inserts and queries clone to/from user
      * @param {string} [options.cloneMethod='parse-stringify'] - 'parse-stringify', 'jquery-extend-deep', 'shallow, 'shallow-assign'
@@ -1118,12 +1088,6 @@
         len = this.collections.length;
 
       if (options && options.disableMeta === true) {
-        if (options.disableChangesApi === false) {
-          throw new Error("disableMeta option cannot be passed as true when disableChangesApi is passed as false");
-        }
-        if (options.disableDeltaChangesApi === false) {
-          throw new Error("disableMeta option cannot be passed as true when disableDeltaChangesApi is passed as false");
-        }
         if (typeof options.ttl === "number" && options.ttl > 0) {
           throw new Error("disableMeta option cannot be passed as true when ttl is enabled");
         }
@@ -1140,6 +1104,8 @@
 
       if (this.verbose)
         collection.lokiConsoleWrapper = console;
+      
+      collection.changesChannel = this.changesChannel
 
       return collection;
     };
@@ -1694,7 +1660,7 @@
       for (i; i < len; i += 1) {
         coll = dbObject.collections[i];
 
-        copyColl = this.addCollection(coll.name, { disableChangesApi: coll.disableChangesApi, disableDeltaChangesApi: coll.disableDeltaChangesApi, disableMeta: coll.disableMeta });
+        copyColl = this.addCollection(coll.name, { disableMeta: coll.disableMeta });
 
         copyColl.adaptiveBinaryIndices = coll.hasOwnProperty('adaptiveBinaryIndices')?(coll.adaptiveBinaryIndices === true): false;
         copyColl.transactional = coll.transactional;
@@ -1702,7 +1668,6 @@
         copyColl.cloneObjects = coll.cloneObjects;
         copyColl.cloneMethod = coll.cloneMethod || "parse-stringify";
         copyColl.autoupdate = coll.autoupdate;
-        copyColl.changes = coll.changes;
 
         if (options && options.retainDirtyFlags === true) {
           copyColl.dirty = coll.dirty;
@@ -1866,582 +1831,613 @@
     | PERSISTENCE       |
     -------------------*/
 
-    /** there are two build in persistence adapters for internal use
-     * fs             for use in Nodejs type environments
-     * localStorage   for use in browser environment
-     * defined as helper classes here so its easy and clean to use
+    /** there is only one built in persistence adapter for internal use
+     * indexedDB - for use in browser and service worker environment
+     * defined as helper class here so its easy and clean to use
      */
 
     /**
-     * In in-memory persistence adapter for an in-memory database.
-     * This simple 'key/value' adapter is intended for unit testing and diagnostics.
+     * Loki persistence adapter class for indexedDb.
+     *     This class fulfills abstract adapter interface which can be applied to other storage methods. 
+     *     Utilizes the included LokiCatalog app/key/value database for actual database persistence.
+     *     Indexeddb is highly async, but this adapter has been made 'console-friendly' as well.
+     *     Anywhere a callback is omitted, it should return results (if applicable) to console.
+     *     IndexedDb storage is provided per-domain, so we implement app/key/value database to 
+     *     allow separate contexts for separate apps within a domain.
      *
-     * @param {object=} options - memory adapter options
-     * @param {boolean} [options.asyncResponses=false] - whether callbacks are invoked asynchronously
-     * @param {int} [options.asyncTimeout=50] - timeout in ms to queue callbacks
-     * @constructor LokiMemoryAdapter
+     * @example
+     * var idbAdapter = new LokiIndexedAdapter('finance');
+     *
+     * @constructor LokiIndexedAdapter
+     *
+     * @param {string} appname - (Optional) Application name context can be used to distinguish subdomains, 'loki' by default
+     * @param {object=} options Configuration options for the adapter
+     * @param {boolean} options.closeAfterSave Whether the indexedDB database should be closed after saving.
      */
-    function LokiMemoryAdapter(options) {
-      this.hashStore = {};
+    function LokiIndexedAdapter(appname, options)
+    {
+      this.app = 'loki';
       this.options = options || {};
 
-      if (!this.options.hasOwnProperty('asyncResponses')) {
-        this.options.asyncResponses = false;
+      if (typeof (appname) !== 'undefined')
+      {
+        this.app = appname;
       }
 
-      if (!this.options.hasOwnProperty('asyncTimeout')) {
-        this.options.asyncTimeout = 50; // 50 ms default
+      // keep reference to catalog class for base AKV operations
+      this.catalog = null;
+
+      if (!this.checkAvailability()) {
+        throw new Error('indexedDB does not seem to be supported for your environment');
       }
     }
 
     /**
-     * Loads a serialized database from its in-memory store.
-     * (Loki persistence adapter interface function)
-     *
-     * @param {string} dbname - name of the database (filename/keyname)
-     * @param {function} callback - adapter callback to return load result to caller
-     * @memberof LokiMemoryAdapter
+     * Used for closing the indexeddb database.
      */
-    LokiMemoryAdapter.prototype.loadDatabase = function (dbname, callback) {
-      var self=this;
-
-      if (this.options.asyncResponses) {
-        setTimeout(function() {
-          if (self.hashStore.hasOwnProperty(dbname)) {
-            callback(self.hashStore[dbname].value);
-          }
-          else {
-            // database doesn't exist, return falsy
-            callback (null);
-          }
-        }, this.options.asyncTimeout);
+    LokiIndexedAdapter.prototype.closeDatabase = function ()
+    {
+      if (this.catalog && this.catalog.db) {
+        this.catalog.db.close();
+        this.catalog.db = null;
       }
-      else {
-        if (this.hashStore.hasOwnProperty(dbname)) {
-          // database doesn't exist, return falsy
-          callback(this.hashStore[dbname].value);
+    };
+
+    /**
+     * Used to check if adapter is available
+     *
+     * @returns {boolean} true if indexeddb is available, false if not.
+     * @memberof LokiIndexedAdapter
+     */
+    LokiIndexedAdapter.prototype.checkAvailability = function()
+    {
+      if (typeof indexedDB !== 'undefined' && indexedDB) return true;
+
+      return false;
+    };
+
+    /**
+     * Retrieves a serialized db string from the catalog.
+     *
+     * @example
+     * // LOAD
+     * var idbAdapter = new LokiIndexedAdapter('finance');
+     * var db = new loki('test', { adapter: idbAdapter });
+     *   db.loadDatabase(function(result) {
+     *   console.log('done');
+     * });
+     *
+     * @param {string} dbname - the name of the database to retrieve.
+     * @param {function} callback - callback should accept string param containing serialized db string.
+     * @memberof LokiIndexedAdapter
+     */
+    LokiIndexedAdapter.prototype.loadDatabase = function(dbname, callback)
+    {
+      var appName = this.app;
+      var adapter = this;
+
+      // lazy open/create db reference so dont -need- callback in constructor
+      if (this.catalog === null || this.catalog.db === null) {
+        this.catalog = new LokiCatalog(function(cat) {
+          adapter.catalog = cat;
+
+          adapter.loadDatabase(dbname, callback);
+        });
+
+        return;
+      }
+
+      // lookup up db string in AKV db
+      this.catalog.getAppKey(appName, dbname, function(result) {
+        if (typeof (callback) === 'function') {
+          if (result.id === 0) {
+            callback(null);
+            return;
+          }
+          callback(result.val);
         }
         else {
-          callback (null);
+          // support console use of api
+          console.log(result.val);
         }
-      }
+      });
     };
 
-    /**
-     * Saves a serialized database to its in-memory store.
-     * (Loki persistence adapter interface function)
-     *
-     * @param {string} dbname - name of the database (filename/keyname)
-     * @param {function} callback - adapter callback to return load result to caller
-     * @memberof LokiMemoryAdapter
-     */
-    LokiMemoryAdapter.prototype.saveDatabase = function (dbname, dbstring, callback) {
-      var self=this;
-      var saveCount;
-
-      if (this.options.asyncResponses) {
-        setTimeout(function() {
-          saveCount = (self.hashStore.hasOwnProperty(dbname)?self.hashStore[dbname].savecount:0);
-
-          self.hashStore[dbname] = {
-            savecount: saveCount+1,
-            lastsave: new Date(),
-            value: dbstring
-          };
-
-          callback();
-        }, this.options.asyncTimeout);
-      }
-      else {
-        saveCount = (this.hashStore.hasOwnProperty(dbname)?this.hashStore[dbname].savecount:0);
-
-        this.hashStore[dbname] = {
-          savecount: saveCount+1,
-          lastsave: new Date(),
-          value: dbstring
-        };
-
-        callback();
-      }
-    };
+    // alias
+    LokiIndexedAdapter.prototype.loadKey = LokiIndexedAdapter.prototype.loadDatabase;
 
     /**
-     * Deletes a database from its in-memory store.
+     * Saves a serialized db to the catalog.
      *
-     * @param {string} dbname - name of the database (filename/keyname)
-     * @param {function} callback - function to call when done
-     * @memberof LokiMemoryAdapter
-     */
-    LokiMemoryAdapter.prototype.deleteDatabase = function(dbname, callback) {
-      if (this.hashStore.hasOwnProperty(dbname)) {
-        delete this.hashStore[dbname];
-      }
-
-      if (typeof callback === "function") {
-        callback();
-      }
-    };
-
-    /**
-     * An adapter for adapters.  Converts a non reference mode adapter into a reference mode adapter
-     * which can perform destructuring and partioning.  Each collection will be stored in its own key/save and
-     * only dirty collections will be saved.  If you  turn on paging with default page size of 25megs and save
-     * a 75 meg collection it should use up roughly 3 save slots (key/value pairs sent to inner adapter).
-     * A dirty collection that spans three pages will save all three pages again
-     * Paging mode was added mainly because Chrome has issues saving 'too large' of a string within a
-     * single indexeddb row.  If a single document update causes the collection to be flagged as dirty, all
-     * of that collection's pages will be written on next save.
+     * @example
+     * // SAVE : will save App/Key/Val as 'finance'/'test'/{serializedDb}
+     * var idbAdapter = new LokiIndexedAdapter('finance');
+     * var db = new loki('test', { adapter: idbAdapter });
+     * var coll = db.addCollection('testColl');
+     * coll.insert({test: 'val'});
+     * db.saveDatabase();  // could pass callback if needed for async complete
      *
-     * @param {object} adapter - reference to a 'non-reference' mode loki adapter instance.
-     * @param {object=} options - configuration options for partitioning and paging
-     * @param {bool} options.paging - (default: false) set to true to enable paging collection data.
-     * @param {int} options.pageSize - (default : 25MB) you can use this to limit size of strings passed to inner adapter.
-     * @param {string} options.delimiter - allows you to override the default delimeter
-     * @constructor LokiPartitioningAdapter
+     * @param {string} dbname - the name to give the serialized database within the catalog.
+     * @param {string} dbstring - the serialized db string to save.
+     * @param {function} callback - (Optional) callback passed obj.success with true or false
+     * @memberof LokiIndexedAdapter
      */
-    function LokiPartitioningAdapter(adapter, options) {
-      this.mode = "reference";
-      this.adapter = null;
-      this.options = options || {};
-      this.dbref = null;
-      this.dbname = "";
-      this.pageIterator = {};
+    LokiIndexedAdapter.prototype.saveDatabase = function(dbname, dbstring, callback)
+    {
+      var appName = this.app;
+      var adapter = this;
 
-      // verify user passed an appropriate adapter
-      if (adapter) {
-        if (adapter.mode === "reference") {
-          throw new Error("LokiPartitioningAdapter cannot be instantiated with a reference mode adapter");
+      function saveCallback(result) {
+        if (result && result.success === true) {
+          callback(null);
         }
         else {
-          this.adapter = adapter;
+          callback(new Error("Error saving database"));
+        }
+
+        if (adapter.options.closeAfterSave) {
+          adapter.closeDatabase();
         }
       }
-      else {
-        throw new Error("LokiPartitioningAdapter requires a (non-reference mode) adapter on construction");
+
+      // lazy open/create db reference so dont -need- callback in constructor
+      if (this.catalog === null || this.catalog.db === null) {
+        this.catalog = new LokiCatalog(function(cat) {
+          adapter.saveDatabase(dbname, dbstring, saveCallback);
+        });
+
+        return;
       }
 
-      // set collection paging defaults
-      if (!this.options.hasOwnProperty("paging")) {
-        this.options.paging = false;
-      }
+      // set (add/update) entry to AKV database
+      this.catalog.setAppKey(appName, dbname, dbstring, saveCallback);
+    };
 
-      // default to page size of 25 megs (can be up to your largest serialized object size larger than this)
-      if (!this.options.hasOwnProperty("pageSize")) {
-        this.options.pageSize = 25*1024*1024;
-      }
-
-      if (!this.options.hasOwnProperty("delimiter")) {
-        this.options.delimiter = '$<\n';
-      }
-    }
+    // alias
+    LokiIndexedAdapter.prototype.saveKey = LokiIndexedAdapter.prototype.saveDatabase;
 
     /**
-     * Loads a database which was partitioned into several key/value saves.
-     * (Loki persistence adapter interface function)
+     * Deletes a serialized db from the catalog.
      *
-     * @param {string} dbname - name of the database (filename/keyname)
-     * @param {function} callback - adapter callback to return load result to caller
-     * @memberof LokiPartitioningAdapter
+     * @example
+     * // DELETE DATABASE
+     * // delete 'finance'/'test' value from catalog
+     * idbAdapter.deleteDatabase('test', function {
+     *   // database deleted
+     * });
+     *
+     * @param {string} dbname - the name of the database to delete from the catalog.
+     * @param {function=} callback - (Optional) executed on database delete
+     * @memberof LokiIndexedAdapter
      */
-    LokiPartitioningAdapter.prototype.loadDatabase = function (dbname, callback) {
+    LokiIndexedAdapter.prototype.deleteDatabase = function(dbname, callback)
+    {
+      var appName = this.app;
+      var adapter = this;
+
+      // lazy open/create db reference and pass callback ahead
+      if (this.catalog === null || this.catalog.db === null) {
+        this.catalog = new LokiCatalog(function(cat) {
+          adapter.catalog = cat;
+
+          adapter.deleteDatabase(dbname, callback);
+        });
+
+        return;
+      }
+
+      // catalog was already initialized, so just lookup object and delete by id
+      this.catalog.getAppKey(appName, dbname, function(result) {
+        var id = result.id;
+
+        if (id !== 0) {
+          adapter.catalog.deleteAppKey(id, callback);
+        } else if (typeof (callback) === 'function') {
+          callback({ success: true });
+        }
+      });
+    };
+
+    // alias
+    LokiIndexedAdapter.prototype.deleteKey = LokiIndexedAdapter.prototype.deleteDatabase;
+
+    /**
+     * Removes all database partitions and pages with the base filename passed in.
+     * This utility method does not (yet) guarantee async deletions will be completed before returning
+     *
+     * @param {string} dbname - the base filename which container, partitions, or pages are derived
+     * @memberof LokiIndexedAdapter
+     */
+    LokiIndexedAdapter.prototype.deleteDatabasePartitions = function(dbname) {
       var self=this;
-      this.dbname = dbname;
-      this.dbref = new Loki(dbname);
-
-      // load the db container (without data)
-      this.adapter.loadDatabase(dbname, function(result) {
-        // empty database condition is for inner adapter return null/undefined/falsy
-        if (!result) {
-          // partition 0 not found so new database, no need to try to load other partitions.
-          // return same falsy result to loadDatabase to signify no database exists (yet)
-          callback(result);
-          return;
-        }
-
-        if (typeof result !== "string") {
-          callback(new Error("LokiPartitioningAdapter received an unexpected response from inner adapter loadDatabase()"));
-        }
-
-        // I will want to use loki destructuring helper methods so i will inflate into typed instance
-        var db = JSON.parse(result);
-        self.dbref.loadJSONObject(db);
-        db = null;
-
-        var clen = self.dbref.collections.length;
-
-        if (self.dbref.collections.length === 0) {
-          callback(self.dbref);
-          return;
-        }
-
-        self.pageIterator = {
-          collection: 0,
-          pageIndex: 0
-        };
-
-        self.loadNextPartition(0, function() {
-          callback(self.dbref);
+      this.getDatabaseList(function(result) {
+        result.forEach(function(str) {
+          if (str.startsWith(dbname)) {
+            self.deleteDatabase(str);
+          }
         });
       });
     };
 
     /**
-     * Used to sequentially load each collection partition, one at a time.
+     * Retrieves object array of catalog entries for current app.
      *
-     * @param {int} partition - ordinal collection position to load next
-     * @param {function} callback - adapter callback to return load result to caller
+     * @example
+     * idbAdapter.getDatabaseList(function(result) {
+     *   // result is array of string names for that appcontext ('finance')
+     *   result.forEach(function(str) {
+     *     console.log(str);
+     *   });
+     * });
+     *
+     * @param {function} callback - should accept array of database names in the catalog for current app.
+     * @memberof LokiIndexedAdapter
      */
-    LokiPartitioningAdapter.prototype.loadNextPartition = function(partition, callback) {
-      var keyname = this.dbname + "." + partition;
-      var self=this;
+    LokiIndexedAdapter.prototype.getDatabaseList = function(callback)
+    {
+      var appName = this.app;
+      var adapter = this;
 
-      if (this.options.paging === true) {
-        this.pageIterator.pageIndex = 0;
-        this.loadNextPage(callback);
-        return;
-      }
+      // lazy open/create db reference so dont -need- callback in constructor
+      if (this.catalog === null || this.catalog.db === null) {
+        this.catalog = new LokiCatalog(function(cat) {
+          adapter.catalog = cat;
 
-      this.adapter.loadDatabase(keyname, function(result) {
-        var data = self.dbref.deserializeCollection(result, { delimited: true, collectionIndex: partition });
-        self.dbref.collections[partition].data = data;
-
-        if (++partition < self.dbref.collections.length) {
-          self.loadNextPartition(partition, callback);
-        }
-        else {
-          callback();
-        }
-      });
-    };
-
-    /**
-     * Used to sequentially load the next page of collection partition, one at a time.
-     *
-     * @param {function} callback - adapter callback to return load result to caller
-     */
-    LokiPartitioningAdapter.prototype.loadNextPage = function(callback) {
-      // calculate name for next saved page in sequence
-      var keyname = this.dbname + "." + this.pageIterator.collection + "." + this.pageIterator.pageIndex;
-      var self=this;
-
-      // load whatever page is next in sequence
-      this.adapter.loadDatabase(keyname, function(result) {
-        var data = result.split(self.options.delimiter);
-        result = ""; // free up memory now that we have split it into array
-        var dlen = data.length;
-        var idx;
-
-        // detect if last page by presence of final empty string element and remove it if so
-        var isLastPage = (data[dlen-1] === "");
-        if (isLastPage) {
-          data.pop();
-          dlen = data.length;
-          // empty collections are just a delimiter meaning two blank items
-          if (data[dlen-1] === "" && dlen === 1) {
-            data.pop();
-            dlen = data.length;
-          }
-        }
-
-        // convert stringified array elements to object instances and push to collection data
-        for(idx=0; idx < dlen; idx++) {
-          self.dbref.collections[self.pageIterator.collection].data.push(JSON.parse(data[idx]));
-          data[idx] = null;
-        }
-        data = [];
-
-        // if last page, we are done with this partition
-        if (isLastPage) {
-
-          // if there are more partitions, kick off next partition load
-          if (++self.pageIterator.collection < self.dbref.collections.length) {
-            self.loadNextPartition(self.pageIterator.collection, callback);
-          }
-          else {
-            callback();
-          }
-        }
-        else {
-          self.pageIterator.pageIndex++;
-          self.loadNextPage(callback);
-        }
-      });
-    };
-
-    /**
-     * Saves a database by partioning into separate key/value saves.
-     * (Loki 'reference mode' persistence adapter interface function)
-     *
-     * @param {string} dbname - name of the database (filename/keyname)
-     * @param {object} dbref - reference to database which we will partition and save.
-     * @param {function} callback - adapter callback to return load result to caller
-     *
-     * @memberof LokiPartitioningAdapter
-     */
-    LokiPartitioningAdapter.prototype.exportDatabase = function(dbname, dbref, callback) {
-      var self=this;
-      var idx, clen = dbref.collections.length;
-
-      this.dbref = dbref;
-      this.dbname = dbname;
-
-      // queue up dirty partitions to be saved
-      this.dirtyPartitions = [-1];
-      for(idx=0; idx<clen; idx++) {
-        if (dbref.collections[idx].dirty) {
-          this.dirtyPartitions.push(idx);
-        }
-      }
-
-      this.saveNextPartition(function(err) {
-        callback(err);
-      });
-    };
-
-    /**
-     * Helper method used internally to save each dirty collection, one at a time.
-     *
-     * @param {function} callback - adapter callback to return load result to caller
-     */
-    LokiPartitioningAdapter.prototype.saveNextPartition = function(callback) {
-      var self=this;
-      var partition = this.dirtyPartitions.shift();
-      var keyname = this.dbname + ((partition===-1)?"":("." + partition));
-
-      // if we are doing paging and this is collection partition
-      if (this.options.paging && partition !== -1) {
-        this.pageIterator = {
-          collection: partition,
-          docIndex: 0,
-          pageIndex: 0
-        };
-
-        // since saveNextPage recursively calls itself until done, our callback means this whole paged partition is finished
-        this.saveNextPage(function(err) {
-          if (self.dirtyPartitions.length === 0) {
-            callback(err);
-          }
-          else {
-            self.saveNextPartition(callback);
-          }
+          adapter.getDatabaseList(callback);
         });
+
         return;
       }
 
-      // otherwise this is 'non-paged' partioning...
-      var result = this.dbref.serializeDestructured({
-        partitioned : true,
-        delimited: true,
-        partition: partition
-      });
+      // catalog already initialized
+      // get all keys for current appName, and transpose results so just string array
+      this.catalog.getAppKeys(appName, function(results) {
+        var names = [];
 
-      this.adapter.saveDatabase(keyname, result, function(err) {
-        if (err) {
-          callback(err);
-          return;
+        for(var idx = 0; idx < results.length; idx++) {
+          names.push(results[idx].key);
         }
 
-        if (self.dirtyPartitions.length === 0) {
-          callback(null);
+        if (typeof (callback) === 'function') {
+          callback(names);
         }
         else {
-          self.saveNextPartition(callback);
+          names.forEach(function(obj) {
+            console.log(obj);
+          });
+        }
+      });
+    };
+
+    // alias
+    LokiIndexedAdapter.prototype.getKeyList = LokiIndexedAdapter.prototype.getDatabaseList;
+
+    /**
+     * Allows retrieval of list of all keys in catalog along with size
+     *
+     * @param {function} callback - (Optional) callback to accept result array.
+     * @memberof LokiIndexedAdapter
+     */
+    LokiIndexedAdapter.prototype.getCatalogSummary = function(callback)
+    {
+      var appName = this.app;
+      var adapter = this;
+
+      // lazy open/create db reference
+      if (this.catalog === null || this.catalog.db === null) {
+        this.catalog = new LokiCatalog(function(cat) {
+          adapter.catalog = cat;
+
+          adapter.getCatalogSummary(callback);
+        });
+
+        return;
+      }
+
+      // catalog already initialized
+      // get all keys for current appName, and transpose results so just string array
+      this.catalog.getAllKeys(function(results) {
+        var entries = [];
+        var obj,
+          size,
+          oapp,
+          okey,
+          oval;
+
+        for(var idx = 0; idx < results.length; idx++) {
+          obj = results[idx];
+          oapp = obj.app || '';
+          okey = obj.key || '';
+          oval = obj.val || '';
+
+          // app and key are composited into an appkey column so we will mult by 2
+          size = oapp.length * 2 + okey.length * 2 + oval.length + 1;
+
+          entries.push({ "app": obj.app, "key": obj.key, "size": size });
+        }
+
+        if (typeof (callback) === 'function') {
+          callback(entries);
+        }
+        else {
+          entries.forEach(function(obj) {
+            console.log(obj);
+          });
         }
       });
     };
 
     /**
-     * Helper method used internally to generate and save the next page of the current (dirty) partition.
-     *
-     * @param {function} callback - adapter callback to return load result to caller
+     * LokiCatalog - underlying App/Key/Value catalog persistence
+     *    This non-interface class implements the actual persistence.
+     *    Used by the IndexedAdapter class.
      */
-    LokiPartitioningAdapter.prototype.saveNextPage = function(callback) {
-      var self=this;
-      var coll = this.dbref.collections[this.pageIterator.collection];
-      var keyname = this.dbname + "." + this.pageIterator.collection + "." + this.pageIterator.pageIndex;
-      var pageLen=0,
-        cdlen = coll.data.length,
-        delimlen = this.options.delimiter.length;
-      var serializedObject = "",
-        pageBuilder = "";
-      var doneWithPartition=false,
-        doneWithPage=false;
+    function LokiCatalog(callback)
+    {
+      this.db = null;
+      this.initializeLokiCatalog(callback);
+    }
 
-      var pageSaveCallback = function(err) {
-        pageBuilder = "";
+    LokiCatalog.prototype.initializeLokiCatalog = function(callback) {
+      var openRequest = indexedDB.open('LokiCatalog', 1);
+      var cat = this;
 
-        if (err) {
-          callback(err);
+      // If database doesn't exist yet or its version is lower than our version specified above (2nd param in line above)
+      openRequest.onupgradeneeded = function(e) {
+        var thisDB = e.target.result;
+        if (thisDB.objectStoreNames.contains('LokiAKV')) {
+          thisDB.deleteObjectStore('LokiAKV');
         }
 
-        // update meta properties then continue process by invoking callback
-        if (doneWithPartition) {
-          callback(null);
-        }
-        else {
-          self.pageIterator.pageIndex++;
-          self.saveNextPage(callback);
+        if(!thisDB.objectStoreNames.contains('LokiAKV')) {
+          var objectStore = thisDB.createObjectStore('LokiAKV', { keyPath: 'id', autoIncrement:true });
+          objectStore.createIndex('app', 'app', {unique:false});
+          objectStore.createIndex('key', 'key', {unique:false});
+          // hack to simulate composite key since overhead is low (main size should be in val field)
+          // user (me) required to duplicate the app and key into comma delimited appkey field off object
+          // This will allow retrieving single record with that composite key as well as
+          // still supporting opening cursors on app or key alone
+          objectStore.createIndex('appkey', 'appkey', {unique:true});
         }
       };
 
-      if (coll.data.length === 0) {
-        doneWithPartition = true;
-      }
+      openRequest.onsuccess = function(e) {
+        cat.db = e.target.result;
 
-      while (true) {
-        if (!doneWithPartition) {
-          // serialize object
-          serializedObject = JSON.stringify(coll.data[this.pageIterator.docIndex]);
-          pageBuilder += serializedObject;
-          pageLen += serializedObject.length;
+        if (typeof (callback) === 'function') callback(cat);
+      };
 
-          // if no more documents in collection to add, we are done with partition
-          if (++this.pageIterator.docIndex >= cdlen) doneWithPartition = true;
-        }
-        // if our current page is bigger than defined pageSize, we are done with page
-        if (pageLen >= this.options.pageSize) doneWithPage = true;
-
-        // if not done with current page, need delimiter before next item
-        // if done with partition we also want a delmiter to indicate 'end of pages' final empty row
-        if (!doneWithPage || doneWithPartition) {
-          pageBuilder += this.options.delimiter;
-          pageLen += delimlen;
-        }
-
-        // if we are done with page save it and pass off to next recursive call or callback
-        if (doneWithPartition || doneWithPage) {
-          this.adapter.saveDatabase(keyname, pageBuilder, pageSaveCallback);
-          return;
-        }
-      }
+      openRequest.onerror = function(e) {
+        throw e;
+      };
     };
 
-    /**
-     * A loki persistence adapter which persists using node fs module
-     * @constructor LokiFsAdapter
-     */
-    function LokiFsAdapter() {
-      try {
-        this.fs = require('fs');
-      }catch(e) {
-        this.fs = null;
-      }
-    }
+    LokiCatalog.prototype.getAppKey = function(app, key, callback) {
+      var transaction = this.db.transaction(['LokiAKV'], 'readonly');
+      var store = transaction.objectStore('LokiAKV');
+      var index = store.index('appkey');
+      var appkey = app + "," + key;
+      var request = index.get(appkey);
 
-    /**
-     * loadDatabase() - Load data from file, will throw an error if the file does not exist
-     * @param {string} dbname - the filename of the database to load
-     * @param {function} callback - the callback to handle the result
-     * @memberof LokiFsAdapter
-     */
-    LokiFsAdapter.prototype.loadDatabase = function loadDatabase(dbname, callback) {
-      var self = this;
+      request.onsuccess = (function(usercallback) {
+        return function(e) {
+          var lres = e.target.result;
 
-      this.fs.stat(dbname, function (err, stats) {
-        if (!err && stats.isFile()) {
-          self.fs.readFile(dbname, {
-            encoding: 'utf8'
-          }, function readFileCallback(err, data) {
-            if (err) {
-              callback(new Error(err));
-            } else {
-              callback(data);
-            }
-          });
+          if (lres === null || typeof(lres) === 'undefined') {
+            lres = {
+              id: 0,
+              success: false
+            };
+          }
+
+          if (typeof(usercallback) === 'function') {
+            usercallback(lres);
+          }
+          else {
+            console.log(lres);
+          }
+        };
+      })(callback);
+
+      request.onerror = (function(usercallback) {
+        return function(e) {
+          if (typeof(usercallback) === 'function') {
+            usercallback({ id: 0, success: false });
+          }
+          else {
+            throw e;
+          }
+        };
+      })(callback);
+    };
+
+    LokiCatalog.prototype.getAppKeyById = function (id, callback, data) {
+      var transaction = this.db.transaction(['LokiAKV'], 'readonly');
+      var store = transaction.objectStore('LokiAKV');
+      var request = store.get(id);
+
+      request.onsuccess = (function(data, usercallback){
+        return function(e) {
+          if (typeof(usercallback) === 'function') {
+            usercallback(e.target.result, data);
+          }
+          else {
+            console.log(e.target.result);
+          }
+        };
+      })(data, callback);
+    };
+
+    LokiCatalog.prototype.setAppKey = function (app, key, val, callback) {
+      var transaction = this.db.transaction(['LokiAKV'], 'readwrite');
+      var store = transaction.objectStore('LokiAKV');
+      var index = store.index('appkey');
+      var appkey = app + "," + key;
+      var request = index.get(appkey);
+
+      // first try to retrieve an existing object by that key
+      // need to do this because to update an object you need to have id in object, otherwise it will append id with new autocounter and clash the unique index appkey
+      request.onsuccess = function(e) {
+        var res = e.target.result;
+
+        if (res === null || res === undefined) {
+          res = {
+            app:app,
+            key:key,
+            appkey: app + ',' + key,
+            val:val
+          };
         }
         else {
-          callback(null);
+          res.val = val;
         }
-      });
+
+        var requestPut = store.put(res);
+
+        requestPut.onerror = (function(usercallback) {
+          return function(e) {
+            if (typeof(usercallback) === 'function') {
+              usercallback({ success: false });
+            }
+            else {
+              console.error('LokiCatalog.setAppKey (set) onerror');
+              console.error(request.error);
+            }
+          };
+
+        })(callback);
+
+        requestPut.onsuccess = (function(usercallback) {
+          return function(e) {
+            if (typeof(usercallback) === 'function') {
+              usercallback({ success: true });
+            }
+          };
+        })(callback);
+      };
+
+      request.onerror = (function(usercallback) {
+        return function(e) {
+          if (typeof(usercallback) === 'function') {
+            usercallback({ success: false });
+          }
+          else {
+            console.error('LokiCatalog.setAppKey (get) onerror');
+            console.error(request.error);
+          }
+        };
+      })(callback);
     };
 
-    /**
-     * saveDatabase() - save data to file, will throw an error if the file can't be saved
-     * might want to expand this to avoid dataloss on partial save
-     * @param {string} dbname - the filename of the database to load
-     * @param {function} callback - the callback to handle the result
-     * @memberof LokiFsAdapter
-     */
-    LokiFsAdapter.prototype.saveDatabase = function saveDatabase(dbname, dbstring, callback) {
-      var self = this;
-      var tmpdbname = dbname + '~';
-      this.fs.writeFile(tmpdbname, dbstring, function writeFileCallback(err) {
-        if (err) {
-          callback(new Error(err));
-        } else {
-          self.fs.rename(tmpdbname,dbname,callback);
-        }
-      });
+    LokiCatalog.prototype.deleteAppKey = function (id, callback) {
+      var transaction = this.db.transaction(['LokiAKV'], 'readwrite');
+      var store = transaction.objectStore('LokiAKV');
+      var request = store.delete(id);
+
+      request.onsuccess = (function(usercallback) {
+        return function(evt) {
+          if (typeof(usercallback) === 'function') usercallback({ success: true });
+        };
+      })(callback);
+
+      request.onerror = (function(usercallback) {
+        return function(evt) {
+          if (typeof(usercallback) === 'function') {
+            usercallback({ success: false });
+          }
+          else {
+            console.error('LokiCatalog.deleteAppKey raised onerror');
+            console.error(request.error);
+          }
+        };
+      })(callback);
     };
 
-    /**
-     * deleteDatabase() - delete the database file, will throw an error if the
-     * file can't be deleted
-     * @param {string} dbname - the filename of the database to delete
-     * @param {function} callback - the callback to handle the result
-     * @memberof LokiFsAdapter
-     */
-    LokiFsAdapter.prototype.deleteDatabase = function deleteDatabase(dbname, callback) {
-      this.fs.unlink(dbname, function deleteDatabaseCallback(err) {
-        if (err) {
-          callback(new Error(err));
-        } else {
-          callback();
-        }
-      });
+    LokiCatalog.prototype.getAppKeys = function(app, callback) {
+      var transaction = this.db.transaction(['LokiAKV'], 'readonly');
+      var store = transaction.objectStore('LokiAKV');
+      var index = store.index('app');
+
+      // We want cursor to all values matching our (single) app param
+      var singleKeyRange = IDBKeyRange.only(app);
+
+      // To use one of the key ranges, pass it in as the first argument of openCursor()/openKeyCursor()
+      var cursor = index.openCursor(singleKeyRange);
+
+      // cursor internally, pushing results into this.data[] and return
+      // this.data[] when done (similar to service)
+      var localdata = [];
+
+      cursor.onsuccess = (function(data, callback) {
+        return function(e) {
+          var cursor = e.target.result;
+          if (cursor) {
+            var currObject = cursor.value;
+
+            data.push(currObject);
+
+            cursor.continue();
+          }
+          else {
+            if (typeof(callback) === 'function') {
+              callback(data);
+            }
+            else {
+              console.log(data);
+            }
+          }
+        };
+      })(localdata, callback);
+
+      cursor.onerror = (function(usercallback) {
+        return function(e) {
+          if (typeof(usercallback) === 'function') {
+            usercallback(null);
+          }
+          else {
+            console.error('LokiCatalog.getAppKeys raised onerror');
+            console.error(e);
+          }
+        };
+      })(callback);
+
     };
 
+    // Hide 'cursoring' and return array of { id: id, key: key }
+    LokiCatalog.prototype.getAllKeys = function (callback) {
+      var transaction = this.db.transaction(['LokiAKV'], 'readonly');
+      var store = transaction.objectStore('LokiAKV');
+      var cursor = store.openCursor();
 
-    /**
-     * A loki persistence adapter which persists to web browser's local storage object
-     * @constructor LokiLocalStorageAdapter
-     */
-    function LokiLocalStorageAdapter() {}
+      var localdata = [];
 
-    /**
-     * loadDatabase() - Load data from localstorage
-     * @param {string} dbname - the name of the database to load
-     * @param {function} callback - the callback to handle the result
-     * @memberof LokiLocalStorageAdapter
-     */
-    LokiLocalStorageAdapter.prototype.loadDatabase = function loadDatabase(dbname, callback) {
-      if (localStorageAvailable()) {
-        callback(localStorage.getItem(dbname));
-      } else {
-        callback(new Error('localStorage is not available'));
-      }
-    };
+      cursor.onsuccess = (function(data, callback) {
+        return function(e) {
+          var cursor = e.target.result;
+          if (cursor) {
+            var currObject = cursor.value;
 
-    /**
-     * saveDatabase() - save data to localstorage, will throw an error if the file can't be saved
-     * might want to expand this to avoid dataloss on partial save
-     * @param {string} dbname - the filename of the database to load
-     * @param {function} callback - the callback to handle the result
-     * @memberof LokiLocalStorageAdapter
-     */
-    LokiLocalStorageAdapter.prototype.saveDatabase = function saveDatabase(dbname, dbstring, callback) {
-      if (localStorageAvailable()) {
-        localStorage.setItem(dbname, dbstring);
-        callback(null);
-      } else {
-        callback(new Error('localStorage is not available'));
-      }
-    };
+            data.push(currObject);
 
-    /**
-     * deleteDatabase() - delete the database from localstorage, will throw an error if it
-     * can't be deleted
-     * @param {string} dbname - the filename of the database to delete
-     * @param {function} callback - the callback to handle the result
-     * @memberof LokiLocalStorageAdapter
-     */
-    LokiLocalStorageAdapter.prototype.deleteDatabase = function deleteDatabase(dbname, callback) {
-      if (localStorageAvailable()) {
-        localStorage.removeItem(dbname);
-        callback(null);
-      } else {
-        callback(new Error('localStorage is not available'));
-      }
+            cursor.continue();
+          }
+          else {
+            if (typeof(callback) === 'function') {
+              callback(data);
+            }
+            else {
+              console.log(data);
+            }
+          }
+        };
+      })(localdata, callback);
+
+      cursor.onerror = (function(usercallback) {
+        return function(e) {
+          if (typeof(usercallback) === 'function') usercallback(null);
+        };
+      })(callback);
+
     };
 
     /**
@@ -3671,12 +3667,6 @@
         options.forceCloneMethod = options.forceCloneMethod || 'shallow';
       }
 
-      // if collection has delta changes active, then force clones and use 'parse-stringify' for effective change tracking of nested objects
-      if (!this.collection.disableDeltaChangesApi) {
-        options.forceClones = true;
-        options.forceCloneMethod = 'parse-stringify';
-      }
-
       // if this has no filters applied, just return collection.data
       if (!this.filterInitialized) {
         if (this.filteredrows.length === 0) {
@@ -3737,7 +3727,7 @@
      *   user.phoneFormat = "+49 AAAA BBBBBB";
      * });
      */
-    Resultset.prototype.update = function (updateFunction) {
+    Resultset.prototype.update = function (updateFunction, isSync = false) {
 
       if (typeof (updateFunction) !== "function") {
         throw new TypeError('Argument is not a function');
@@ -3753,16 +3743,16 @@
 
       // pass in each document object currently in resultset to user supplied updateFunction
       for (var idx = 0; idx < len; idx++) {
-        // if we have cloning option specified or are doing differential delta changes, clone object first
-        if (this.collection.cloneObjects || !this.collection.disableDeltaChangesApi) {
+        // if we have cloning option specified, clone object first
+        if (this.collection.cloneObjects) {
           obj = clone(rcd[this.filteredrows[idx]], this.collection.cloneMethod);
           updateFunction(obj);
-          this.collection.update(obj);
+          this.collection.update(obj, isSync);
         }
         else {
           // no need to clone, so just perform update on collection data object instance
           updateFunction(rcd[this.filteredrows[idx]]);
-          this.collection.update(rcd[this.filteredrows[idx]]);
+          this.collection.update(rcd[this.filteredrows[idx]], isSync);
         }
       }
 
@@ -3778,14 +3768,14 @@
      * // remove users inactive since 1/1/2001
      * users.chain().find({ lastActive: { $lte: new Date("1/1/2001").getTime() } }).remove();
      */
-    Resultset.prototype.remove = function () {
+    Resultset.prototype.remove = function (isSync = false) {
 
       // if this has no filters applied, we need to populate filteredrows first
       if (!this.filterInitialized && this.filteredrows.length === 0) {
         this.filteredrows = this.collection.prepareFullDocIndex();
       }
 
-      this.collection.removeBatchByPositions(this.filteredrows);
+      this.collection.removeBatchByPositions(this.filteredrows, isSync);
 
       this.filteredrows = [];
 
@@ -4758,8 +4748,6 @@
      * @param {boolean} [options.adaptiveBinaryIndices=true] - collection indices will be actively rebuilt rather than lazily
      * @param {boolean} [options.asyncListeners=false] - whether listeners are invoked asynchronously
      * @param {boolean} [options.disableMeta=false] - set to true to disable meta property on documents
-     * @param {boolean} [options.disableChangesApi=true] - set to false to enable Changes API
-     * @param {boolean} [options.disableDeltaChangesApi=true] - set to false to enable Delta Changes API (requires Changes API, forces cloning)
      * @param {boolean} [options.autoupdate=false] - use Object.observe to update objects automatically
      * @param {boolean} [options.clone=false] - specify whether inserts and queries clone to/from user
      * @param {boolean} [options.serializableIndices=true[]] - converts date values on binary indexed properties to epoch time
@@ -4842,13 +4830,6 @@
       // if set to true we will not maintain a meta property for a document
       this.disableMeta = options.hasOwnProperty('disableMeta') ? options.disableMeta : false;
 
-      // disable track changes
-      this.disableChangesApi = options.hasOwnProperty('disableChangesApi') ? options.disableChangesApi : true;
-
-      // disable delta update object style on changes
-      this.disableDeltaChangesApi = options.hasOwnProperty('disableDeltaChangesApi') ? options.disableDeltaChangesApi : true;
-      if (this.disableChangesApi) { this.disableDeltaChangesApi = true; }
-
       // option to observe objects and update them automatically, ignored if Object.observe is not supported
       this.autoupdate = options.hasOwnProperty('autoupdate') ? options.autoupdate : false;
 
@@ -4882,9 +4863,6 @@
         'delete': [],
         'warning': []
       };
-
-      // changes are tracked by collection and aggregated by the db
-      this.changes = [];
 
       // initialize the id index
       this.ensureId();
@@ -4930,63 +4908,10 @@
 
       this.observerCallback = observerCallback;
 
-      //Compare changed object (which is a forced clone) with existing object and return the delta
-      function getChangeDelta(obj, old) {
-        if (old) {
-          return getObjectDelta(old, obj);
-        }
-        else {
-          return JSON.parse(JSON.stringify(obj));
-        }
-      }
-
-      this.getChangeDelta = getChangeDelta;
-
-      function getObjectDelta(oldObject, newObject) {
-        var propertyNames = newObject !== null && typeof newObject === 'object' ? Object.keys(newObject) : null;
-        if (propertyNames && propertyNames.length && ['string', 'boolean', 'number'].indexOf(typeof(newObject)) < 0) {
-          var delta = {};
-          for (var i = 0; i < propertyNames.length; i++) {
-            var propertyName = propertyNames[i];
-            if (newObject.hasOwnProperty(propertyName)) {
-              if (!oldObject.hasOwnProperty(propertyName) || self.uniqueNames.indexOf(propertyName) >= 0 || propertyName == '$loki' || propertyName == 'meta') {
-                delta[propertyName] = newObject[propertyName];
-              }
-              else {
-                var propertyDelta = getObjectDelta(oldObject[propertyName], newObject[propertyName]);
-                if (typeof propertyDelta !== "undefined" && propertyDelta != {}) {
-                  delta[propertyName] = propertyDelta;
-                }
-              }
-            }
-          }
-          return Object.keys(delta).length === 0 ? undefined : delta;
-        }
-        else {
-          return oldObject === newObject ? undefined : newObject;
-        }
-      }
-
-      this.getObjectDelta = getObjectDelta;
-
-      // clear all the changes
-      function flushChanges() {
-        self.changes = [];
-      }
-
-      this.getChanges = function () {
-        return self.changes;
-      };
-
       this.flushChanges = flushChanges;
 
-      this.setChangesApi = function (enabled) {
-        self.disableChangesApi = !enabled;
-        if (!enabled) { self.disableDeltaChangesApi = false; }
-      };
-
-      this.on('delete', function deleteCallback(obj) {
-        if (!self.disableChangesApi) {
+      this.on('delete', function deleteCallback(obj, isSync = false) {
+        if (!isSync) {
           self.createChange(self.name, 'R', obj);
         }
       });
@@ -5000,15 +4925,19 @@
 
     Collection.prototype = new LokiEventEmitter();
 
-    /*
-      * For ChangeAPI default to clone entire object, for delta changes create object with only differences (+ $loki and meta)
-      */
-    Collection.prototype.createChange = function(name, op, obj, old) {
-      this.changes.push({
+    Collection.prototype.createChange = function(name, op, obj) {
+      var change = {
         name: name,
         operation: op,
-        obj: op == 'U' && !this.disableDeltaChangesApi ? this.getChangeDelta(obj, old) : JSON.parse(JSON.stringify(obj))
-      });
+        obj: JSON.parse(JSON.stringify(obj))
+      }
+      
+      if (this.changesChannel) {
+        this.changesChannel.postMessage({
+          type: "POST_CHANGES",
+          payload: change
+        })
+      }
     };
 
     Collection.prototype.insertMeta = function(obj) {
@@ -5598,12 +5527,12 @@
      * @param {function} updateFunction - update function to run against filtered documents
      * @memberof Collection
      */
-    Collection.prototype.findAndUpdate = function (filterObject, updateFunction) {
+    Collection.prototype.findAndUpdate = function (filterObject, updateFunction, isSync = false) {
       if (typeof (filterObject) === "function") {
-        this.updateWhere(filterObject, updateFunction);
+        this.updateWhere(filterObject, updateFunction, isSync);
       }
       else {
-        this.chain().find(filterObject).update(updateFunction);
+        this.chain().find(filterObject).update(updateFunction, isSync);
       }
     };
 
@@ -5632,9 +5561,9 @@
      * // alternatively, insert array of documents
      * users.insert([{ name: 'Thor', age: 35}, { name: 'Loki', age: 30}]);
      */
-    Collection.prototype.insert = function (doc) {
+    Collection.prototype.insert = function (doc, isSync = false) {
       if (!Array.isArray(doc)) {
-        return this.insertOne(doc);
+        return this.insertOne(doc, false, isSync);
       }
 
       // holder to the clone of the object inserted if collections is set to clone objects
@@ -5643,7 +5572,7 @@
 
       this.emit('pre-insert', doc);
       for (var i = 0, len = doc.length; i < len; i++) {
-        obj = this.insertOne(doc[i], true);
+        obj = this.insertOne(doc[i], true, isSync);
         if (!obj) {
           return undefined;
         }
@@ -5663,9 +5592,10 @@
      * Adds a single object, ensures it has meta properties, clone it if necessary, etc.
      * @param {object} doc - the document to be inserted
      * @param {boolean} bulkInsert - quiet pre-insert and insert event emits
+     * @param {boolean} isSync - 
      * @returns {object} document or 'undefined' if there was a problem inserting it
      */
-    Collection.prototype.insertOne = function (doc, bulkInsert) {
+    Collection.prototype.insertOne = function (doc, bulkInsert, isSync = false) {
       var err = null;
       var returnObj;
 
@@ -5699,9 +5629,9 @@
         return undefined;
       }
 
-      // update meta and store changes if ChangesAPI is enabled
+      // update meta and emit changes if the action is not for syncing
       // (moved from "insert" event listener to allow internal reference to be used)
-      if (this.disableChangesApi) {
+      if (isSync) {
         this.insertMeta(obj);
       }
       else {
@@ -5775,7 +5705,7 @@
      * @param {object} doc - document to update within the collection
      * @memberof Collection
      */
-    Collection.prototype.update = function (doc) {
+    Collection.prototype.update = function (doc, isSync = false) {
       var adaptiveBatchOverride, k, len;
 
       if (Array.isArray(doc)) {
@@ -5792,7 +5722,7 @@
 
         try {
           for (k=0; k < len; k += 1) {
-            this.update(doc[k]);
+            this.update(doc[k], isSync);
           }
         }
         finally {
@@ -5825,7 +5755,7 @@
         position = arr[1]; // position in data array
 
         // if configured to clone, do so now... otherwise just use same obj reference
-        newInternal = this.cloneObjects || !this.disableDeltaChangesApi ? clone(doc, this.cloneMethod) : doc;
+        newInternal = this.cloneObjects ? clone(doc, this.cloneMethod) : doc;
 
         this.emit('pre-update', doc);
 
@@ -5864,8 +5794,8 @@
         this.commit();
         this.dirty = true; // for autosave scenarios
 
-        // update meta and store changes if ChangesAPI is enabled
-        if (this.disableChangesApi) {
+        // update meta and emit changes if the action is not for syncing
+        if (isSync) {
           this.updateMeta(newInternal, null);
         }
         else {
@@ -5976,14 +5906,14 @@
      * @param {function} updateFunction - update function to run against filtered documents
      * @memberof Collection
      */
-    Collection.prototype.updateWhere = function(filterFunction, updateFunction) {
+    Collection.prototype.updateWhere = function(filterFunction, updateFunction, isSync = false) {
       var results = this.where(filterFunction),
         i = 0,
         obj;
       try {
         for (i; i < results.length; i++) {
           obj = updateFunction(results[i]);
-          this.update(obj);
+          this.update(obj, isSync);
         }
 
       } catch (err) {
@@ -6016,7 +5946,7 @@
      * Internal method to remove a batch of documents from the collection.
      * @param {number[]} positions - data/idIndex positions to remove
      */
-    Collection.prototype.removeBatchByPositions = function(positions) {
+    Collection.prototype.removeBatchByPositions = function(positions, isSync) {
       var len = positions.length;
       var xo = {};
       var dlen, didx, idx;
@@ -6073,9 +6003,9 @@
         // emit 'delete' events only of listeners are attached.
         // since data not removed yet, in future we can emit single delete event with array...
         // for now that might be breaking change to put in potential 1.6 or LokiDB (lokijs2) version
-        if (!this.disableChangesApi || this.events.delete.length > 1) {
+        if (this.events.delete.length > 1) {
           for(idx=0; idx < len; idx++) {
-            this.emit('delete', this.data[positions[idx]]);
+            this.emit('delete', this.data[positions[idx]], isSync);
           }
         }
 
@@ -6117,7 +6047,7 @@
      *  Internal method called by remove()
      * @param {object[]|number[]} batch - array of documents or $loki ids to remove
      */
-    Collection.prototype.removeBatch = function(batch) {
+    Collection.prototype.removeBatch = function(batch, isSync = false) {
       var len = batch.length,
         dlen=this.data.length,
         idx;
@@ -6139,7 +6069,7 @@
         }
       }
 
-      this.removeBatchByPositions(posx);
+      this.removeBatchByPositions(posx, isSync);
     };
 
     /**
@@ -6147,7 +6077,7 @@
      * @param {object} doc - document to remove from collection
      * @memberof Collection
      */
-    Collection.prototype.remove = function (doc) {
+    Collection.prototype.remove = function (doc, isSync = false) {
       if (typeof doc === 'number') {
         doc = this.get(doc);
       }
@@ -6156,7 +6086,7 @@
         throw new Error('Parameter is not an object');
       }
       if (Array.isArray(doc)) {
-        this.removeBatch(doc);
+        this.removeBatch(doc, isSync);
         return;
       }
 
@@ -6200,7 +6130,7 @@
 
         this.commit();
         this.dirty = true; // for autosave scenarios
-        this.emit('delete', arr[0]);
+        this.emit('delete', arr[0], isSync);
         delete doc.$loki;
         delete doc.meta;
         return doc;
@@ -7441,14 +7371,7 @@
     Loki.LokiOps = LokiOps;
     Loki.Collection = Collection;
     Loki.KeyValueStore = KeyValueStore;
-    Loki.LokiMemoryAdapter = LokiMemoryAdapter;
-    Loki.LokiPartitioningAdapter = LokiPartitioningAdapter;
-    Loki.LokiLocalStorageAdapter = LokiLocalStorageAdapter;
-    Loki.LokiFsAdapter = LokiFsAdapter;
-    Loki.persistenceAdapters = {
-      fs: LokiFsAdapter,
-      localStorage: LokiLocalStorageAdapter
-    };
+    Loki.IndexedAdapter = LokiIndexedAdapter;
     Loki.aeq = aeqHelper;
     Loki.lt = ltHelper;
     Loki.gt = gtHelper;
