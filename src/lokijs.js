@@ -913,8 +913,9 @@
 
       var self = this
       this.changesChannel.addEventListener("message", function (event) {
-        if (event.data.type === "POST_CHANGES") {
-          saveChanges.call(self, event.data.payload)
+        var data = JSON.parse(event.data)
+        if (data.type === "POST_CHANGES") {
+          saveChanges.call(self, data.payload)
         }
       })
 
@@ -4857,17 +4858,19 @@
     Collection.prototype = new LokiEventEmitter();
 
     Collection.prototype.createChange = function(name, op, obj) {
-      var change = {
-        name: name,
-        operation: op,
-        obj: JSON.parse(JSON.stringify(obj))
-      }
-      
       if (this.changesChannel) {
-        this.changesChannel.postMessage({
+        var change = {
+          name: name,
+          operation: op,
+          obj: obj
+        }
+
+        var message = JSON.stringify({
           type: "POST_CHANGES",
           payload: change
         })
+
+        this.changesChannel.postMessage(message)
       }
     };
 
