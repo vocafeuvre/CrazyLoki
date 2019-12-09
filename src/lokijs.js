@@ -912,12 +912,22 @@
       }
 
       var self = this
-      this.changesChannel.addEventListener("message", function (event) {
-        var data = JSON.parse(event.data)
-        if (data.type === "POST_CHANGES") {
-          saveChanges.call(self, data.payload)
-        }
-      })
+      var loadChangesChannel = function () {
+        self.changesChannel.addEventListener("message", function (event) {
+          var data = JSON.parse(event.data)
+          if (data.type === "POST_CHANGES") {
+            saveChanges.call(self, data.payload)
+          }
+        })
+      }
+
+      var oldAutoloadCallback = options.autoloadCallback
+
+      // try to load the changes channel after the autoload callback is executed
+      options.autoloadCallback = function () {
+        oldAutoloadCallback()
+        loadChangesChannel()
+      }
 
       if (globalThis) {
         if (!('indexedDB' in globalThis)) {
